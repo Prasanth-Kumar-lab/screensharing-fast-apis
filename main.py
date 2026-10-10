@@ -74,6 +74,15 @@ def serialize_doc(doc: dict) -> dict:
 async def on_startup():
     await init_db_indexes()
 
+@app.get("/", summary="Root health check")
+@app.get("/health", summary="Health check endpoint for Render and uptime monitors")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "Screen Sharing Fast APIs",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
 # ==============================================================================
 # 1. AUTHENTICATION & DYNAMIC OTP (Sent in response for UI Snackbar)
 # ==============================================================================
