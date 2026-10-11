@@ -451,18 +451,16 @@ async def get_active_plans():
 @app.websocket("/ws/signaling/{room_code}/{role}")
 async def websocket_signaling(websocket: WebSocket, room_code: str, role: str):
     """
-    WebSocket endpoint handling:
-    - connection-request / connection-accepted / connection-declined
-    - start-sharing / stop-sharing
-    - offer / answer (SDP exchange)
-    - ice-candidate
-    - remote-input (tap, longpress, swipe)
-    - remote-system-action (back, home, recent)
-    - quality-feedback
+    Hybrid P2P WebRTC (STUN) + FastAPI WebSocket Frame & Control Relay:
+    - WebRTC SDP/ICE signaling (offer, answer, ice-candidate)
+    - Zero-buffer binary & JSON video frame relay (video-frame, frame-ack)
+    - Remote touch & system controls (remote-input, remote-system-action)
+    - Live Master-to-User reflection (whiteboard-draw, whiteboard-clear, laser-pointer,
+      master-recording, master-screenshot, chat-message, remote-clipboard, remote-hardware)
     """
     room_code = room_code.upper()
     await signaling_manager.connect(room_code, role, websocket)
-    
+
     # Update device online state in MongoDB
     if role == "user":
         await devices_collection.update_one(
@@ -473,7 +471,20 @@ async def websocket_signaling(websocket: WebSocket, room_code: str, role: str):
 
     try:
         while True:
-            text_data = await websocket.receive_text()
+            ws_msg = await websocket.receive()
+            if ws_msg.get("type") == "websocket.disconnect":
+                break
+
+            bytes_data = ws_msg.get("bytes")
+            if bytes_data is not None:
+                # Direct binary JPEG frame relay with zero buffering
+                await signaling_manager.relay_frame(room_code, role, bytes_data)
+                continue
+
+            text_data = ws_msg.get("text")
+            if not text_data:
+                continue
+
             try:
                 data = json.loads(text_data)
             except json.JSONDecodeError:
@@ -483,6 +494,10 @@ async def websocket_signaling(websocket: WebSocket, room_code: str, role: str):
             await signaling_manager.relay_message(room_code, role, data)
 
     except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"⚠️ WebSocket error in room '{room_code}' ({role}): {e}")
+    finally:
         signaling_manager.disconnect(room_code, role)
         if role == "user":
             await devices_collection.update_one(
