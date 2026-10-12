@@ -1,7 +1,8 @@
 import os
 
 # MongoDB Configuration
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+DEFAULT_MONGO_URI = "mongodb+srv://prasanthkumartera_db_user:VwUlBKW6Jx47cD66@cluster0.im2fcm0.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+MONGO_URI = os.getenv("MONGO_URI", DEFAULT_MONGO_URI)
 DATABASE_NAME = os.getenv("DATABASE_NAME", "screensharing_db")
 
 # JWT Configuration
