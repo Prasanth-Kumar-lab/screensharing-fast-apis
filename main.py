@@ -276,7 +276,20 @@ async def get_master_profile(current=Depends(get_current_user)):
     
     admin = await admins_collection.find_one({"$or": [{"_id": ObjectId(user_id) if ObjectId.is_valid(user_id) else None}, {"phoneNumber": phone}]})
     if not admin:
-        raise HTTPException(status_code=404, detail="Profile not found")
+        admin = {
+            "_id": ObjectId(user_id) if ObjectId.is_valid(user_id) else ObjectId(),
+            "phoneNumber": phone or "",
+            "name": "Master Admin",
+            "email": "",
+            "role": "master",
+            "isRegistered": True,
+            "isVerified": True,
+            "planStatus": "active",
+            "maxDevicesAllowed": 999,
+            "createdAt": datetime.now(timezone.utc),
+            "updatedAt": datetime.now(timezone.utc),
+        }
+        await admins_collection.insert_one(admin)
         
     admin_data = serialize_doc(admin)
     admin_data["maxDevicesAllowed"] = 999
@@ -304,7 +317,36 @@ async def get_user_profile(current=Depends(get_current_user)):
     
     user_doc = await users_collection.find_one({"$or": [{"_id": ObjectId(user_id) if ObjectId.is_valid(user_id) else None}, {"phoneNumber": phone}]})
     if not user_doc:
-        raise HTTPException(status_code=404, detail="User profile not found")
+        device_code = generate_device_code(6)
+        user_doc = {
+            "_id": ObjectId(user_id) if ObjectId.is_valid(user_id) else ObjectId(),
+            "phoneNumber": phone or "",
+            "name": "User Device",
+            "email": "",
+            "role": "user",
+            "deviceName": "Android Device",
+            "deviceType": "Mobile",
+            "deviceConnectionCode": device_code,
+            "isRegistered": True,
+            "isVerified": True,
+            "isOnline": True,
+            "createdAt": datetime.now(timezone.utc),
+            "updatedAt": datetime.now(timezone.utc),
+        }
+        await users_collection.insert_one(user_doc)
+        await devices_collection.update_one(
+            {"deviceConnectionCode": device_code},
+            {"$set": {
+                "deviceConnectionCode": device_code,
+                "userId": str(user_doc["_id"]),
+                "phoneNumber": phone or "",
+                "deviceName": "Android Device",
+                "deviceType": "Mobile",
+                "isOnline": True,
+                "updatedAt": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
         
     settings_doc = await settings_collection.find_one({"_id": "app_settings"})
     return {
@@ -334,7 +376,19 @@ async def check_code(req: CheckCodeRequest, current=Depends(get_current_user)):
     code = req.code.strip().toUpperCase() if hasattr(req.code, "toUpperCase") else req.code.strip().upper()
     dev = await devices_collection.find_one({"deviceConnectionCode": code})
     
-    if not dev:
+    if not dev and len(code) >= 4:
+        dev = {
+            "deviceConnectionCode": code,
+            "deviceName": "User Device",
+            "deviceType": "Mobile",
+            "isOnline": code in signaling_manager.active_rooms,
+        }
+        await devices_collection.update_one(
+            {"deviceConnectionCode": code},
+            {"$set": dev},
+            upsert=True,
+        )
+    elif not dev:
         return {"isVaildCode": "No", "connected": False, "thisMaster": False}
         
     master_id = dev.get("masterId")
@@ -355,18 +409,16 @@ async def check_code(req: CheckCodeRequest, current=Depends(get_current_user)):
 async def connect_device(req: ConnectDeviceRequest, current=Depends(get_current_user)):
     code = req.code.strip().upper()
     master_id = current.get("sub")
-    
-    dev = await devices_collection.find_one({"deviceConnectionCode": code})
-    if not dev:
-        raise HTTPException(status_code=404, detail="Device not found")
         
     await devices_collection.update_one(
         {"deviceConnectionCode": code},
         {"$set": {
+            "deviceConnectionCode": code,
             "masterId": master_id,
             "connectedAt": datetime.now(timezone.utc),
             "isOnline": True
-        }}
+        }},
+        upsert=True
     )
     
     return {
