@@ -24,6 +24,10 @@ class SignalingManager:
                 "info": {"online": True},
                 "sending_frame": False,
                 "latest_frame": None,
+                "sending_audio_user": False,
+                "latest_audio_user": None,
+                "sending_audio_master": False,
+                "latest_audio_master": None,
             }
 
         self.active_rooms[room_code][role] = websocket
@@ -83,6 +87,47 @@ class SignalingManager:
         if not room.get("sending_frame"):
             asyncio.create_task(self._drain_latest_frame(room_code, target_role))
 
+    async def _drain_latest_audio(self, room_code: str, target_role: str):
+        room = self.active_rooms.get(room_code)
+        sending_key = f"sending_audio_{target_role}"
+        latest_key = f"latest_audio_{target_role}"
+        if not room or room.get(sending_key):
+            return
+        room[sending_key] = True
+        try:
+            while room_code in self.active_rooms:
+                payload = room.get(latest_key)
+                if payload is None:
+                    break
+                room[latest_key] = None
+                target_ws: Optional[WebSocket] = room.get(target_role)
+                if not target_ws:
+                    break
+                try:
+                    await target_ws.send_text(payload)
+                except Exception:
+                    break
+        finally:
+            if room_code in self.active_rooms:
+                self.active_rooms[room_code][sending_key] = False
+
+    async def relay_audio(self, room_code: str, sender_role: str, raw_payload: str):
+        """
+        Zero-buffer bidirectional PCM audio relay: guarantees Master <-> User voice
+        packets never build up latency if a network spike occurs.
+        """
+        room = self.active_rooms.get(room_code)
+        if not room:
+            return
+        target_role = "master" if sender_role == "user" else "user"
+        if not room.get(target_role):
+            return
+        latest_key = f"latest_audio_{target_role}"
+        sending_key = f"sending_audio_{target_role}"
+        room[latest_key] = raw_payload
+        if not room.get(sending_key):
+            asyncio.create_task(self._drain_latest_audio(room_code, target_role))
+
     async def relay_message(self, room_code: str, sender_role: str, message: dict):
         if room_code not in self.active_rooms:
             return
@@ -90,6 +135,9 @@ class SignalingManager:
         msg_type = message.get("event") or message.get("type")
         if msg_type == "video-frame":
             await self.relay_frame(room_code, sender_role, json.dumps(message))
+            return
+        if msg_type == "audio-chunk":
+            await self.relay_audio(room_code, sender_role, json.dumps(message))
             return
 
         target_role = "master" if sender_role == "user" else "user"
