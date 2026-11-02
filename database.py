@@ -149,17 +149,36 @@ class _ResilientCursor:
         self._query = query
         self._args = args
         self._kwargs = kwargs
+        self._sort_key = None
+        self._sort_dir = 1
+
+    def sort(self, key_or_list, direction=1):
+        if isinstance(key_or_list, list):
+            if key_or_list and len(key_or_list) > 0:
+                self._sort_key = key_or_list[0][0]
+                self._sort_dir = key_or_list[0][1] if len(key_or_list[0]) > 1 else 1
+        elif isinstance(key_or_list, tuple):
+            self._sort_key = key_or_list[0]
+            self._sort_dir = key_or_list[1] if len(key_or_list) > 1 else 1
+        else:
+            self._sort_key = key_or_list
+            self._sort_dir = direction
+        return self
 
     async def to_list(self, length: Optional[int] = None) -> List[Dict[str, Any]]:
         global _mongo_available
         if _mongo_available and self._col._motor_col is not None:
             try:
                 motor_cursor = self._col._motor_col.find(self._query, *self._args, **self._kwargs)
+                if self._sort_key:
+                    motor_cursor = motor_cursor.sort(self._sort_key, self._sort_dir)
                 return await motor_cursor.to_list(length)
             except Exception as e:
                 if _switch_to_default_mongo():
                     try:
                         motor_cursor = self._col._motor_col.find(self._query, *self._args, **self._kwargs)
+                        if self._sort_key:
+                            motor_cursor = motor_cursor.sort(self._sort_key, self._sort_dir)
                         return await motor_cursor.to_list(length)
                     except Exception:
                         pass
@@ -167,6 +186,12 @@ class _ResilientCursor:
                 _mongo_available = False
 
         matched = [doc for doc in self._col._memory_docs if _doc_matches(doc, self._query)]
+        if self._sort_key:
+            reverse = (self._sort_dir == -1 or self._sort_dir == "desc" or self._sort_dir == "DESC")
+            try:
+                matched.sort(key=lambda d: str(d.get(self._sort_key, "")), reverse=reverse)
+            except Exception:
+                pass
         if length is None or length < 0:
             return [dict(d) for d in matched]
         return [dict(d) for d in matched[:length]]
@@ -272,6 +297,43 @@ class ResilientCollection:
 
         return _UpdateResult(matched_count=0, modified_count=0)
 
+    async def delete_one(self, query: Dict[str, Any], *args, **kwargs):
+        global _mongo_available
+        if _mongo_available and self._motor_col is not None:
+            try:
+                return await self._motor_col.delete_one(query, *args, **kwargs)
+            except Exception as e:
+                if _switch_to_default_mongo():
+                    try:
+                        return await self._motor_col.delete_one(query, *args, **kwargs)
+                    except Exception:
+                        pass
+                print(f"⚠️ [DB Fallback] MongoDB error on '{self.name}.delete_one': {e}")
+                _mongo_available = False
+
+        for i, doc in enumerate(self._memory_docs):
+            if _doc_matches(doc, query):
+                self._memory_docs.pop(i)
+                return True
+        return False
+
+    async def delete_many(self, query: Dict[str, Any], *args, **kwargs):
+        global _mongo_available
+        if _mongo_available and self._motor_col is not None:
+            try:
+                return await self._motor_col.delete_many(query, *args, **kwargs)
+            except Exception as e:
+                if _switch_to_default_mongo():
+                    try:
+                        return await self._motor_col.delete_many(query, *args, **kwargs)
+                    except Exception:
+                        pass
+                print(f"⚠️ [DB Fallback] MongoDB error on '{self.name}.delete_many': {e}")
+                _mongo_available = False
+
+        self._memory_docs = [doc for doc in self._memory_docs if not _doc_matches(doc, query)]
+        return True
+
     def find(self, query: Optional[Dict[str, Any]] = None, *args, **kwargs):
         return _ResilientCursor(self, query or {}, args, kwargs)
 
@@ -284,6 +346,7 @@ otps_collection = ResilientCollection("otps")            # Dynamic OTP verificat
 support_collection = ResilientCollection("support")      # Support tickets
 settings_collection = ResilientCollection("settings")    # Terms, App links, Charges, etc.
 plans_collection = ResilientCollection("plans")          # Plans catalog
+notifications_collection = ResilientCollection("notifications") # Real-time user device notifications
 
 ALL_COLLECTIONS = [
     users_collection,
@@ -293,6 +356,7 @@ ALL_COLLECTIONS = [
     support_collection,
     settings_collection,
     plans_collection,
+    notifications_collection,
 ]
 
 
@@ -303,6 +367,8 @@ async def init_db_indexes():
         await admins_collection.create_index("phoneNumber", unique=True)
         await devices_collection.create_index("deviceConnectionCode", unique=True)
         await otps_collection.create_index("phoneNumber")
+        await notifications_collection.create_index("roomCode")
+        await notifications_collection.create_index("deviceConnectionCode")
 
         # Initialize default settings if not exists
         existing_settings = await settings_collection.find_one({"_id": "app_settings"})

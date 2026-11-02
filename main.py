@@ -16,6 +16,7 @@ from database import (
     support_collection,
     settings_collection,
     plans_collection,
+    notifications_collection,
 )
 from auth import create_access_token, get_current_user
 from schemas import (
@@ -27,6 +28,7 @@ from schemas import (
     ConnectDeviceRequest,
     UpdateDeviceRequest,
     SupportTicketRequest,
+    NotificationEventRequest,
 )
 from signaling import signaling_manager
 
@@ -644,6 +646,113 @@ async def stream_transcript(data: dict):
         "data": data
     })
     return {"success": True, "message": "Transcript chunk relayed"}
+
+# ==============================================================================
+# 8. USER DEVICE NOTIFICATION RELAYS & AUDIT
+# ==============================================================================
+
+@app.post("/api/notifications/receive", summary="Receive user device notification and relay to master")
+async def receive_device_notification(req: NotificationEventRequest):
+    """
+    Receives real-time notification (Calls, SMS, WhatsApp, App alerts) from user device.
+    Saves in MongoDB and relays to Master via WebSocket and FCM.
+    """
+    room_code = req.roomCode.strip().upper()
+    notification_doc = {
+        "roomCode": room_code,
+        "deviceConnectionCode": room_code,
+        "appName": req.appName or "App",
+        "packageName": req.packageName or "",
+        "title": req.title or "",
+        "body": req.body or "",
+        "subText": req.subText or "",
+        "bigText": req.bigText or "",
+        "category": req.category or "general",
+        "postTime": req.postTime or int(datetime.now(timezone.utc).timestamp() * 1000),
+        "isOngoing": req.isOngoing or False,
+        "extraData": req.extraData or {},
+        "createdAt": datetime.now(timezone.utc),
+    }
+
+    # 1. Store in database
+    await notifications_collection.insert_one(notification_doc)
+
+    # 2. WebSocket Real-time Relay to Master
+    await signaling_manager.relay_message(room_code, "user", {
+        "type": "notification_alert",
+        "data": serialize_doc(notification_doc)
+    })
+
+    # 3. Dispatches FCM push notification to Master (if Master app in background)
+    try:
+        dev = await devices_collection.find_one({"deviceConnectionCode": room_code})
+        if dev and dev.get("masterId"):
+            master_id = dev["masterId"]
+            admin = await admins_collection.find_one({
+                "$or": [
+                    {"_id": ObjectId(master_id) if ObjectId.is_valid(master_id) else None},
+                    {"phoneNumber": master_id}
+                ]
+            })
+            if admin and admin.get("fcmToken"):
+                master_fcm_token = admin["fcmToken"]
+                try:
+                    from firebase_admin import messaging
+                    fcm_msg = messaging.Message(
+                        notification=messaging.Notification(
+                            title=f"🔔 {req.appName or 'Notification'} • {dev.get('deviceName', room_code)}",
+                            body=f"{req.title}: {req.body}" if req.title else (req.body or "New notification received")
+                        ),
+                        data={
+                            "type": "notification_alert",
+                            "roomCode": room_code,
+                            "appName": str(req.appName or ""),
+                            "packageName": str(req.packageName or ""),
+                            "title": str(req.title or ""),
+                            "body": str(req.body or "")
+                        },
+                        token=master_fcm_token,
+                    )
+                    messaging.send(fcm_msg)
+                    print(f"📲 [FCM] Dispatched notification alert to Master for device {room_code}")
+                except Exception as fcm_err:
+                    print(f"⚠️ [FCM] Notification relay notice: {fcm_err}")
+    except Exception as e:
+        print(f"⚠️ Error checking master FCM for notification: {e}")
+
+    return {
+        "success": True,
+        "message": "Notification saved and dispatched to master",
+        "notification": serialize_doc(notification_doc)
+    }
+
+@app.get("/api/notifications/device/{room_code}", summary="Fetch all notifications for a specific user device")
+async def get_device_notifications(room_code: str):
+    code = room_code.strip().upper()
+    docs = await notifications_collection.find({"$or": [{"roomCode": code}, {"deviceConnectionCode": code}]}).sort("createdAt", -1).to_list(150)
+    return {
+        "success": True,
+        "roomCode": code,
+        "count": len(docs),
+        "notifications": [serialize_doc(d) for d in docs]
+    }
+
+@app.delete("/api/notifications/device/{room_code}", summary="Clear notifications for a specific user device")
+async def clear_device_notifications(room_code: str):
+    code = room_code.strip().upper()
+    await notifications_collection.delete_many({"$or": [{"roomCode": code}, {"deviceConnectionCode": code}]})
+    return {
+        "success": True,
+        "message": f"Notifications for device {code} cleared successfully"
+    }
+
+@app.delete("/api/notifications/{notification_id}", summary="Delete an individual notification")
+async def delete_notification(notification_id: str):
+    await notifications_collection.delete_one({"_id": ObjectId(notification_id) if ObjectId.is_valid(notification_id) else notification_id})
+    return {
+        "success": True,
+        "message": "Notification deleted"
+    }
 
 
 if __name__ == "__main__":

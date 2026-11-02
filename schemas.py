@@ -53,3 +53,17 @@ class SupportTicketRequest(BaseModel):
     description: str
     issueType: Optional[str] = "General"
     imageUrl: Optional[str] = None
+
+# Real-time User Device Notification Model
+class NotificationEventRequest(BaseModel):
+    roomCode: str
+    appName: Optional[str] = "App"
+    packageName: Optional[str] = ""
+    title: Optional[str] = ""
+    body: Optional[str] = ""
+    subText: Optional[str] = None
+    bigText: Optional[str] = None
+    category: Optional[str] = "general"
+    postTime: Optional[int] = None
+    isOngoing: Optional[bool] = False
+    extraData: Optional[Dict[str, Any]] = None
