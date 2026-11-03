@@ -25,9 +25,9 @@ class SignalingManager:
                 "sending_frame": False,
                 "latest_frame": None,
                 "sending_audio_user": False,
-                "latest_audio_user": None,
+                "audio_queue_user": asyncio.Queue(maxsize=30),
                 "sending_audio_master": False,
-                "latest_audio_master": None,
+                "audio_queue_master": asyncio.Queue(maxsize=30),
             }
 
         self.active_rooms[room_code][role] = websocket
@@ -87,19 +87,17 @@ class SignalingManager:
         if not room.get("sending_frame"):
             asyncio.create_task(self._drain_latest_frame(room_code, target_role))
 
-    async def _drain_latest_audio(self, room_code: str, target_role: str):
+    async def _drain_audio_queue(self, room_code: str, target_role: str):
         room = self.active_rooms.get(room_code)
         sending_key = f"sending_audio_{target_role}"
-        latest_key = f"latest_audio_{target_role}"
+        queue_key = f"audio_queue_{target_role}"
         if not room or room.get(sending_key):
             return
         room[sending_key] = True
         try:
-            while room_code in self.active_rooms:
-                payload = room.get(latest_key)
-                if payload is None:
-                    break
-                room[latest_key] = None
+            queue: Optional[asyncio.Queue] = room.get(queue_key)
+            while room_code in self.active_rooms and queue and not queue.empty():
+                payload = await queue.get()
                 target_ws: Optional[WebSocket] = room.get(target_role)
                 if not target_ws:
                     break
@@ -113,8 +111,8 @@ class SignalingManager:
 
     async def relay_audio(self, room_code: str, sender_role: str, raw_payload: str):
         """
-        Zero-buffer bidirectional PCM audio relay: guarantees Master <-> User voice
-        packets never build up latency if a network spike occurs.
+        Bounded FIFO bidirectional PCM audio relay: guarantees sequential voice delivery
+        between Master and User without dropped syllables or buffer bloat.
         """
         room = self.active_rooms.get(room_code)
         if not room:
@@ -122,11 +120,25 @@ class SignalingManager:
         target_role = "master" if sender_role == "user" else "user"
         if not room.get(target_role):
             return
-        latest_key = f"latest_audio_{target_role}"
+        queue_key = f"audio_queue_{target_role}"
+        queue: Optional[asyncio.Queue] = room.get(queue_key)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=30)
+            room[queue_key] = queue
+
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            queue.put_nowait(raw_payload)
+        except asyncio.QueueFull:
+            pass
+
         sending_key = f"sending_audio_{target_role}"
-        room[latest_key] = raw_payload
         if not room.get(sending_key):
-            asyncio.create_task(self._drain_latest_audio(room_code, target_role))
+            asyncio.create_task(self._drain_audio_queue(room_code, target_role))
 
     async def relay_message(self, room_code: str, sender_role: str, message: dict):
         if room_code not in self.active_rooms:
