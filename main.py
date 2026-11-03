@@ -1,8 +1,11 @@
+import os
+import uuid
 import random
 import string
 from datetime import datetime, timezone
 from bson import ObjectId
-from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import json
 
@@ -753,6 +756,58 @@ async def delete_notification(notification_id: str):
         "success": True,
         "message": "Notification deleted"
     }
+
+
+# 9. TWO-WAY FILE AND IMAGE TRANSFER (Master <-> User)
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/api/files/upload", summary="Upload file for 2-way transfer between Master and User")
+async def upload_transfer_file(
+    file: UploadFile = File(...),
+    room_code: str = Form(...),
+    sender: str = Form(...)  # "master" or "user"
+):
+    code = room_code.strip().upper()
+    file_id = f"{uuid.uuid4().hex[:12]}_{file.filename}"
+    file_path = os.path.join(UPLOAD_DIR, file_id)
+    
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
+        file_size = len(content)
+
+    download_url = f"/api/files/download/{file_id}"
+    
+    # Notify peer via WebSocket signaling
+    payload = {
+        "event": "file-transfer",
+        "type": "file-transfer",
+        "fileName": file.filename,
+        "fileSize": file_size,
+        "fileId": file_id,
+        "downloadUrl": download_url,
+        "sender": sender,
+    }
+    await signaling_manager.relay_message(code, sender, payload)
+
+    return {
+        "success": True,
+        "message": "File uploaded and dispatched to peer",
+        "fileId": file_id,
+        "fileName": file.filename,
+        "fileSize": file_size,
+        "downloadUrl": download_url,
+    }
+
+@app.get("/api/files/download/{file_id}", summary="Download transferred file")
+async def download_transfer_file(file_id: str):
+    file_path = os.path.join(UPLOAD_DIR, os.path.basename(file_id))
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    original_name = file_id.split("_", 1)[-1] if "_" in file_id else file_id
+    return FileResponse(file_path, filename=original_name)
 
 
 if __name__ == "__main__":
