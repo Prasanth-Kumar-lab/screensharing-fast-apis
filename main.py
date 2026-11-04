@@ -555,8 +555,8 @@ async def websocket_signaling(websocket: WebSocket, room_code: str, role: str):
     except Exception as e:
         print(f"⚠️ WebSocket error in room '{room_code}' ({role}): {e}")
     finally:
-        signaling_manager.disconnect(room_code, role)
-        if role == "user":
+        really_disconnected = signaling_manager.disconnect(room_code, role, websocket)
+        if role == "user" and really_disconnected:
             await devices_collection.update_one(
                 {"deviceConnectionCode": room_code},
                 {"$set": {"isOnline": False}}

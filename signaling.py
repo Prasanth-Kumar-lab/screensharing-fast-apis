@@ -21,7 +21,7 @@ class SignalingManager:
             self.active_rooms[room_code] = {
                 "user": None,
                 "master": None,
-                "info": {"online": True},
+                "info": {"online": True, "is_sharing": False, "is_locked": False},
                 "sending_frame": False,
                 "latest_frame": None,
                 "sending_audio_user": False,
@@ -30,22 +30,45 @@ class SignalingManager:
                 "audio_queue_master": asyncio.Queue(maxsize=30),
             }
 
-        self.active_rooms[room_code][role] = websocket
-        self.active_rooms[room_code]["info"]["online"] = True
+        room = self.active_rooms[room_code]
+        room[role] = websocket
+        room["info"]["online"] = True
+        # Reset any stuck sending flags from previous socket
+        room["sending_frame"] = False
+        room[f"sending_audio_{role}"] = False
         print(f"🔌 [{role.upper()}] connected to room '{room_code}'")
 
-    def disconnect(self, room_code: str, role: str):
+        # If User reconnects while Master is actively waiting in the room, notify Master immediately
+        if role == "user" and room.get("master") is not None:
+            try:
+                await room["master"].send_text(json.dumps({
+                    "event": "resume-stream",
+                    "type": "resume-stream",
+                    "roomCode": room_code,
+                }))
+            except Exception:
+                pass
+
+    def disconnect(self, room_code: str, role: str, websocket: Optional[WebSocket] = None) -> bool:
+        """
+        Removes the socket only if it hasn't already been replaced by a newer reconnected socket.
+        Returns True if the role is now disconnected, False if a newer socket is active.
+        """
         if room_code in self.active_rooms:
-            self.active_rooms[room_code][role] = None
-            if (
-                self.active_rooms[room_code]["user"] is None
-                and self.active_rooms[room_code]["master"] is None
-            ):
+            room = self.active_rooms[room_code]
+            current_ws = room.get(role)
+            if websocket is not None and current_ws is not None and current_ws is not websocket:
+                print(f"ℹ️ [{role.upper()}] stale socket closed in room '{room_code}' (newer socket remains active)")
+                return False
+
+            room[role] = None
+            if room.get("user") is None and room.get("master") is None:
                 del self.active_rooms[room_code]
             else:
                 if role == "user":
-                    self.active_rooms[room_code]["info"]["online"] = False
+                    room["info"]["online"] = False
         print(f"❌ [{role.upper()}] disconnected from room '{room_code}'")
+        return True
 
     async def _drain_latest_frame(self, room_code: str, target_role: str):
         room = self.active_rooms.get(room_code)
@@ -144,7 +167,15 @@ class SignalingManager:
         if room_code not in self.active_rooms:
             return
 
+        room = self.active_rooms[room_code]
         msg_type = message.get("event") or message.get("type")
+        if msg_type in ("start-sharing", "offer", "video-frame", "resume-stream"):
+            room["info"]["is_sharing"] = True
+        elif msg_type == "stop-sharing":
+            room["info"]["is_sharing"] = False
+        elif msg_type == "screen-state":
+            room["info"]["is_locked"] = bool(message.get("isLocked"))
+
         if msg_type == "video-frame":
             await self.relay_frame(room_code, sender_role, json.dumps(message))
             return
@@ -153,7 +184,7 @@ class SignalingManager:
             return
 
         target_role = "master" if sender_role == "user" else "user"
-        target_ws: Optional[WebSocket] = self.active_rooms[room_code].get(target_role)
+        target_ws: Optional[WebSocket] = room.get(target_role)
 
         if target_ws:
             try:
@@ -163,4 +194,3 @@ class SignalingManager:
 
 
 signaling_manager = SignalingManager()
-
