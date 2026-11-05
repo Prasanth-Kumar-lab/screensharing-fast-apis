@@ -442,13 +442,15 @@ async def list_devices(current=Depends(get_current_user)):
     
     result = []
     for d in device_list:
+        active_call = d.get("activeCall")
         result.append({
             "deviceId": d.get("deviceConnectionCode"),
             "deviceName": d.get("deviceName", "Device"),
             "deviceType": d.get("deviceType", "Mobile"),
             "isPrimary": False,
             "status": "active" if d.get("isOnline", True) else "inactive",
-            "phoneNumber": d.get("phoneNumber")
+            "phoneNumber": d.get("phoneNumber"),
+            "activeCall": serialize_doc(active_call) if isinstance(active_call, dict) else None
         })
         
     return {
@@ -582,7 +584,34 @@ async def notify_call_event(data: dict):
     caller_name = data.get("callerName", "Incoming Call")
     caller_number = data.get("callerNumber", "")
     phase = data.get("phase", "ringing")
+    call_type = data.get("type", "incoming_call")
     is_spam = bool(data.get("isSpam", False))
+
+    # Persist active call state on the device document so Master's home screen poll sees it immediately
+    if room_code:
+        if phase in ("ringing", "active"):
+            await devices_collection.update_one(
+                {"deviceConnectionCode": room_code},
+                {"$set": {
+                    "activeCall": {
+                        "roomCode": room_code,
+                        "callerName": caller_name,
+                        "callerNumber": caller_number,
+                        "type": call_type,
+                        "phase": phase,
+                        "isSpam": is_spam,
+                        "timestamp": data.get("timestamp") or int(datetime.now(timezone.utc).timestamp() * 1000),
+                        "updatedAt": datetime.now(timezone.utc)
+                    },
+                    "isOnline": True
+                }},
+                upsert=True
+            )
+        else:
+            await devices_collection.update_one(
+                {"deviceConnectionCode": room_code},
+                {"$set": {"activeCall": None}}
+            )
 
     # 1. Real-time WebSocket relay to connected Master
     await signaling_manager.relay_message(room_code, "user", {
