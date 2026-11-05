@@ -582,6 +582,7 @@ async def notify_call_event(data: dict):
     caller_name = data.get("callerName", "Incoming Call")
     caller_number = data.get("callerNumber", "")
     phase = data.get("phase", "ringing")
+    is_spam = bool(data.get("isSpam", False))
 
     # 1. Real-time WebSocket relay to connected Master
     await signaling_manager.relay_message(room_code, "user", {
@@ -608,9 +609,10 @@ async def notify_call_event(data: dict):
                     import firebase_admin
                     from firebase_admin import messaging
                     
+                    spam_prefix = "⚠️ [SPAM] " if is_spam else "📞 "
                     message = messaging.Message(
                         notification=messaging.Notification(
-                            title=f"📞 Incoming Call on {dev.get('deviceName', room_code)}",
+                            title=f"{spam_prefix}Call on {dev.get('deviceName', room_code)}",
                             body=f"{caller_name} ({caller_number}) is {phase}!"
                         ),
                         data={
@@ -618,7 +620,8 @@ async def notify_call_event(data: dict):
                             "roomCode": room_code,
                             "callerName": str(caller_name),
                             "callerNumber": str(caller_number),
-                            "phase": str(phase)
+                            "phase": str(phase),
+                            "isSpam": "true" if is_spam else "false"
                         },
                         token=master_fcm_token,
                     )
