@@ -443,6 +443,7 @@ async def list_devices(current=Depends(get_current_user)):
     result = []
     for d in device_list:
         active_call = d.get("activeCall")
+        last_ended_call = d.get("lastEndedCall")
         result.append({
             "deviceId": d.get("deviceConnectionCode"),
             "deviceName": d.get("deviceName", "Device"),
@@ -450,7 +451,8 @@ async def list_devices(current=Depends(get_current_user)):
             "isPrimary": False,
             "status": "active" if d.get("isOnline", True) else "inactive",
             "phoneNumber": d.get("phoneNumber"),
-            "activeCall": serialize_doc(active_call) if isinstance(active_call, dict) else None
+            "activeCall": serialize_doc(active_call) if isinstance(active_call, dict) else None,
+            "lastEndedCall": serialize_doc(last_ended_call) if isinstance(last_ended_call, dict) else None,
         })
         
     return {
@@ -518,10 +520,11 @@ async def websocket_signaling(websocket: WebSocket, room_code: str, role: str):
       master-recording, master-screenshot, chat-message, remote-clipboard, remote-hardware)
     """
     room_code = room_code.upper()
+    is_user_role = role.lower().startswith("user")
     await signaling_manager.connect(room_code, role, websocket)
 
     # Update device online state in MongoDB
-    if role == "user":
+    if is_user_role:
         await devices_collection.update_one(
             {"deviceConnectionCode": room_code},
             {"$set": {"isOnline": True}},
@@ -549,6 +552,47 @@ async def websocket_signaling(websocket: WebSocket, room_code: str, role: str):
             except json.JSONDecodeError:
                 continue
 
+            # Synchronize activeCall / lastEndedCall in MongoDB if call_alert arrives via WebSocket
+            ev_type = data.get("event") or data.get("type")
+            if ev_type == "call_alert" and isinstance(data.get("data"), dict):
+                c_data = data["data"]
+                c_phase = str(c_data.get("phase", "ended")).lower()
+                if c_phase in ("ringing", "active"):
+                    await devices_collection.update_one(
+                        {"deviceConnectionCode": room_code},
+                        {"$set": {
+                            "activeCall": {
+                                "roomCode": room_code,
+                                "callerName": c_data.get("callerName", "Incoming Call"),
+                                "callerNumber": c_data.get("callerNumber", ""),
+                                "type": c_data.get("type", "incoming_call"),
+                                "phase": c_phase,
+                                "isSpam": bool(c_data.get("isSpam", False)),
+                                "timestamp": c_data.get("timestamp") or int(datetime.now(timezone.utc).timestamp() * 1000),
+                                "updatedAt": datetime.now(timezone.utc),
+                            },
+                            "isOnline": True,
+                        }},
+                        upsert=True,
+                    )
+                else:
+                    await devices_collection.update_one(
+                        {"deviceConnectionCode": room_code},
+                        {"$set": {
+                            "activeCall": None,
+                            "lastEndedCall": {
+                                "roomCode": room_code,
+                                "callerName": c_data.get("callerName", "Caller"),
+                                "callerNumber": c_data.get("callerNumber", ""),
+                                "type": c_data.get("type", "incoming_call"),
+                                "phase": "ended",
+                                "isSpam": bool(c_data.get("isSpam", False)),
+                                "timestamp": c_data.get("timestamp") or int(datetime.now(timezone.utc).timestamp() * 1000),
+                                "endedAt": datetime.now(timezone.utc),
+                            },
+                        }},
+                    )
+
             # Forward event to peer participant
             await signaling_manager.relay_message(room_code, role, data)
 
@@ -558,7 +602,7 @@ async def websocket_signaling(websocket: WebSocket, room_code: str, role: str):
         print(f"⚠️ WebSocket error in room '{room_code}' ({role}): {e}")
     finally:
         really_disconnected = signaling_manager.disconnect(room_code, role, websocket)
-        if role == "user" and really_disconnected:
+        if is_user_role and really_disconnected:
             await devices_collection.update_one(
                 {"deviceConnectionCode": room_code},
                 {"$set": {"isOnline": False}}
@@ -608,10 +652,29 @@ async def notify_call_event(data: dict):
                 upsert=True
             )
         else:
+            prev_doc = await devices_collection.find_one({"deviceConnectionCode": room_code})
+            prev_active = (prev_doc or {}).get("activeCall") or {}
+            resolved_name = caller_name if caller_name not in ("", "Incoming Call", "Outgoing Call", "Unknown") else (prev_active.get("callerName") or caller_name or "Caller")
+            resolved_num = caller_number if caller_number not in ("", "Active Call", "Unknown") else (prev_active.get("callerNumber") or caller_number)
             await devices_collection.update_one(
                 {"deviceConnectionCode": room_code},
-                {"$set": {"activeCall": None}}
+                {"$set": {
+                    "activeCall": None,
+                    "lastEndedCall": {
+                        "roomCode": room_code,
+                        "callerName": resolved_name,
+                        "callerNumber": resolved_num,
+                        "type": call_type or prev_active.get("type", "incoming_call"),
+                        "phase": "ended",
+                        "isSpam": is_spam or bool(prev_active.get("isSpam", False)),
+                        "timestamp": data.get("timestamp") or int(datetime.now(timezone.utc).timestamp() * 1000),
+                        "endedAt": datetime.now(timezone.utc),
+                    }
+                }}
             )
+            data["callerName"] = resolved_name
+            data["callerNumber"] = resolved_num
+            data["phase"] = "ended"
 
     # 1. Real-time WebSocket relay to connected Master
     await signaling_manager.relay_message(room_code, "user", {
