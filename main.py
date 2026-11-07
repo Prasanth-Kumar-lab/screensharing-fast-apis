@@ -441,11 +441,46 @@ async def list_devices(current=Depends(get_current_user)):
     device_list = await cursor.to_list(100)
     
     result = []
+    now_utc = datetime.now(timezone.utc)
     for d in device_list:
+        code = d.get("deviceConnectionCode")
         active_call = d.get("activeCall")
         last_ended_call = d.get("lastEndedCall")
+
+        # Auto-expire any stale activeCall older than 120 seconds
+        if isinstance(active_call, dict):
+            updated_at = active_call.get("updatedAt")
+            is_stale = False
+            if isinstance(updated_at, datetime):
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+                if (now_utc - updated_at).total_seconds() > 120:
+                    is_stale = True
+            elif isinstance(updated_at, str):
+                try:
+                    parsed_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    if parsed_dt.tzinfo is None:
+                        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                    if (now_utc - parsed_dt).total_seconds() > 120:
+                        is_stale = True
+                except Exception:
+                    pass
+            if is_stale:
+                ended_doc = {
+                    **active_call,
+                    "phase": "ended",
+                    "endedAt": now_utc,
+                }
+                last_ended_call = ended_doc
+                active_call = None
+                if code:
+                    await devices_collection.update_one(
+                        {"deviceConnectionCode": code},
+                        {"$set": {"activeCall": None, "lastEndedCall": ended_doc}},
+                    )
+
         result.append({
-            "deviceId": d.get("deviceConnectionCode"),
+            "deviceId": code,
             "deviceName": d.get("deviceName", "Device"),
             "deviceType": d.get("deviceType", "Mobile"),
             "isPrimary": False,
