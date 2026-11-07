@@ -778,7 +778,235 @@ async def stream_transcript(data: dict):
         "type": "transcript_chunk",
         "data": data
     })
+    # Also forward to any /ws/listener/{room_code} subscribers
+    speaker_str = str(data.get("speaker", "Caller"))
+    role_str = "you" if speaker_str.lower() in ("you", "user", "speaker 1", "speaker 0") else "peer"
+    await call_stream_manager.broadcast_to_listeners(room_code, json.dumps({
+        "type": "transcript",
+        "id": data.get("timestamp") or int(datetime.now(timezone.utc).timestamp() * 1000),
+        "text": data.get("text", ""),
+        "speaker": speaker_str,
+        "role": role_str,
+        "ts": data.get("timestamp") or int(datetime.now(timezone.utc).timestamp() * 1000),
+        "isFinal": bool(data.get("isFinal", True)),
+        "language": data.get("language", "auto"),
+    }))
     return {"success": True, "message": "Transcript chunk relayed"}
+
+
+# ==============================================================================
+# 7B. CALL_TRACKING BINARY PCM16 & JSON STREAMING RELAY (/ws/transcriber & /ws/listener)
+# ==============================================================================
+
+class CallTrackingUserSession:
+    def __init__(self, user_id: str):
+        self.user_id = user_id.upper()
+        self.transcriber: WebSocket | None = None
+        self.listeners: set[WebSocket] = set()
+        self.latest_state: dict = {
+            "phase": "idle",
+            "peerName": None,
+            "peerNumber": None,
+            "youName": "You",
+            "outgoing": False,
+            "startedAt": 0,
+            "language": "auto",
+            "segments": [],
+            "partial": None,
+        }
+
+
+class CallTrackingConnectionManager:
+    def __init__(self):
+        self.active_sessions: dict[str, CallTrackingUserSession] = {}
+
+    def get_or_create(self, user_id: str) -> CallTrackingUserSession:
+        uid = user_id.strip().upper()
+        if uid not in self.active_sessions:
+            self.active_sessions[uid] = CallTrackingUserSession(uid)
+        return self.active_sessions[uid]
+
+    async def connect_transcriber(self, websocket: WebSocket, user_id: str) -> CallTrackingUserSession:
+        await websocket.accept()
+        session = self.get_or_create(user_id)
+        session.transcriber = websocket
+        print(f"🎙️ [CallTranscriber Connected] Room/User: {session.user_id}")
+        return session
+
+    async def connect_listener(self, websocket: WebSocket, user_id: str) -> CallTrackingUserSession:
+        await websocket.accept()
+        session = self.get_or_create(user_id)
+        session.listeners.add(websocket)
+        print(f"🎧 [CallListener Connected] Room/User: {session.user_id} (listeners={len(session.listeners)})")
+        hello_data = {
+            "type": "hello",
+            "user_id": session.user_id,
+            "online": session.transcriber is not None,
+            **session.latest_state,
+        }
+        try:
+            await websocket.send_text(json.dumps(hello_data))
+        except Exception:
+            pass
+        return session
+
+    def disconnect_transcriber(self, user_id: str):
+        uid = user_id.strip().upper()
+        if uid in self.active_sessions:
+            session = self.active_sessions[uid]
+            session.transcriber = None
+            session.latest_state["phase"] = "idle"
+            session.latest_state["partial"] = None
+
+    def disconnect_listener(self, websocket: WebSocket, user_id: str):
+        uid = user_id.strip().upper()
+        if uid in self.active_sessions:
+            session = self.active_sessions[uid]
+            session.listeners.discard(websocket)
+            if not session.listeners and session.transcriber is None:
+                del self.active_sessions[uid]
+
+    async def broadcast_to_listeners(self, user_id: str, message: str | bytes):
+        uid = user_id.strip().upper()
+        session = self.active_sessions.get(uid)
+        if not session or not session.listeners:
+            return
+        dead = []
+        for listener in list(session.listeners):
+            try:
+                if isinstance(message, (bytes, bytearray)):
+                    await listener.send_bytes(message)
+                else:
+                    await listener.send_text(message)
+            except Exception:
+                dead.append(listener)
+        for d in dead:
+            session.listeners.discard(d)
+
+
+call_stream_manager = CallTrackingConnectionManager()
+
+
+@app.get("/users", summary="List active call_tracking transcriber sessions")
+async def list_call_streaming_users():
+    users_list = []
+    for uid, session in call_stream_manager.active_sessions.items():
+        state = session.latest_state
+        users_list.append({
+            "user_id": uid,
+            "online": session.transcriber is not None,
+            "in_call": state.get("phase") == "active",
+            "phase": state.get("phase", "idle"),
+            "peer_name": state.get("peerName") or state.get("name"),
+            "peer_number": state.get("peerNumber") or state.get("number"),
+            "you_name": state.get("youName", "You"),
+            "listeners_count": len(session.listeners),
+        })
+    return {"users": users_list}
+
+
+@app.websocket("/ws/transcriber/{user_id}")
+async def websocket_call_transcriber(websocket: WebSocket, user_id: str):
+    """WebSocket endpoint for Call Transcriber (User device). Streams raw PCM16 bytes + JSON transcripts/VAD."""
+    import base64
+    uid = user_id.strip().upper()
+    session = await call_stream_manager.connect_transcriber(websocket, uid)
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if "text" in msg and msg["text"]:
+                text_content = msg["text"]
+                try:
+                    data = json.loads(text_content)
+                    msg_type = data.get("type")
+                    if msg_type in ("call", "state", "hello"):
+                        for key in ("phase", "peerName", "peerNumber", "name", "number", "youName", "language", "outgoing", "startedAt", "segments", "partial"):
+                            if key in data:
+                                session.latest_state[key] = data[key]
+                        if data.get("phase") == "idle":
+                            session.latest_state["partial"] = None
+                    elif msg_type == "transcript":
+                        if data.get("isFinal"):
+                            segs = list(session.latest_state.get("segments") or [])
+                            segs.append(data)
+                            if len(segs) > 120:
+                                segs = segs[-120:]
+                            session.latest_state["segments"] = segs
+                            session.latest_state["partial"] = None
+                        else:
+                            session.latest_state["partial"] = data
+                        # Bridge transcript to signaling_manager so Master's main signaling socket receives it too
+                        role_val = str(data.get("role", "peer"))
+                        speaker_label = "You (User)" if role_val == "you" else (data.get("speaker") or session.latest_state.get("peerName") or "Caller")
+                        await signaling_manager.relay_message(uid, "user", {
+                            "type": "transcript_chunk",
+                            "event": "transcript_chunk",
+                            "data": {
+                                "roomCode": uid,
+                                "speaker": speaker_label,
+                                "role": role_val,
+                                "text": data.get("text", ""),
+                                "isFinal": bool(data.get("isFinal", True)),
+                                "language": data.get("language") or session.latest_state.get("language") or "auto",
+                                "timestamp": data.get("ts") or int(datetime.now(timezone.utc).timestamp() * 1000),
+                            }
+                        })
+                    elif msg_type == "vad":
+                        await signaling_manager.relay_message(uid, "user", {
+                            "type": "call_vad",
+                            "event": "call_vad",
+                            "data": {
+                                "roomCode": uid,
+                                "you": bool(data.get("you", False)),
+                                "peer": bool(data.get("peer", False)),
+                            }
+                        })
+                    elif msg_type == "language":
+                        lang_code = data.get("code", "auto")
+                        session.latest_state["language"] = lang_code
+                except Exception:
+                    pass
+                await call_stream_manager.broadcast_to_listeners(uid, text_content)
+            elif "bytes" in msg and msg["bytes"]:
+                raw_pcm = msg["bytes"]
+                # 1. Broadcast raw binary PCM16 directly to /ws/listener/{uid} subscribers
+                await call_stream_manager.broadcast_to_listeners(uid, raw_pcm)
+                # 2. Also bridge to signaling_manager if Master is connected via signaling socket
+                b64_pcm = base64.b64encode(raw_pcm).decode("ascii")
+                await signaling_manager.relay_audio(uid, "user", json.dumps({
+                    "type": "audio-chunk",
+                    "event": "audio-chunk",
+                    "pcm": b64_pcm,
+                    "source": "call",
+                }))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"⚠️ [CallTranscriber WS Error] {uid}: {e}")
+    finally:
+        call_stream_manager.disconnect_transcriber(uid)
+        idle_msg = json.dumps({"type": "state", "phase": "idle", "online": False})
+        await call_stream_manager.broadcast_to_listeners(uid, idle_msg)
+
+
+@app.websocket("/ws/listener/{user_id}")
+async def websocket_call_listener(websocket: WebSocket, user_id: str):
+    """WebSocket endpoint for Call Listener (Master device)."""
+    uid = user_id.strip().upper()
+    await call_stream_manager.connect_listener(websocket, uid)
+    try:
+        while True:
+            ws_msg = await websocket.receive()
+            if ws_msg.get("type") == "websocket.disconnect":
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        call_stream_manager.disconnect_listener(websocket, uid)
 
 # ==============================================================================
 # 8. USER DEVICE NOTIFICATION RELAYS & AUDIT
