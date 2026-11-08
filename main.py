@@ -34,6 +34,8 @@ from schemas import (
     NotificationEventRequest,
 )
 from signaling import signaling_manager
+from transliterator import to_romanized, detect_indic_script
+from speech_transcriber import transcribe_audio_bytes
 
 app = FastAPI(
     title="Screen Sharing & Remote Control Fast APIs",
@@ -774,6 +776,13 @@ async def stream_transcript(data: dict):
     }
     """
     room_code = data.get("roomCode", "").upper()
+    raw_text = str(data.get("text", "")).strip()
+    if raw_text:
+        rom_text, det_lang = to_romanized(raw_text)
+        data["romanized"] = rom_text
+        if not data.get("language") or data.get("language") == "auto":
+            data["language"] = det_lang
+
     await signaling_manager.relay_message(room_code, "user", {
         "type": "transcript_chunk",
         "data": data
@@ -784,7 +793,8 @@ async def stream_transcript(data: dict):
     await call_stream_manager.broadcast_to_listeners(room_code, json.dumps({
         "type": "transcript",
         "id": data.get("timestamp") or int(datetime.now(timezone.utc).timestamp() * 1000),
-        "text": data.get("text", ""),
+        "text": raw_text,
+        "romanized": data.get("romanized", ""),
         "speaker": speaker_str,
         "role": role_str,
         "ts": data.get("timestamp") or int(datetime.now(timezone.utc).timestamp() * 1000),
@@ -792,6 +802,35 @@ async def stream_transcript(data: dict):
         "language": data.get("language", "auto"),
     }))
     return {"success": True, "message": "Transcript chunk relayed"}
+
+@app.post("/api/call/transcribe-audio", summary="Free universal speech transcription without third-party APIs")
+async def transcribe_call_audio(
+    file: UploadFile = File(...),
+    roomCode: str = Form(""),
+    speaker: str = Form("Caller"),
+    language: str = Form("auto")
+):
+    """
+    100% Free self-hosted speech transcription supporting any language (Telugu, Hindi, English, etc.)
+    with automatic Romanized English transliteration ('Hi ra tinava?').
+    """
+    audio_bytes = await file.read()
+    result = transcribe_audio_bytes(audio_bytes, filename=file.filename or "audio.wav", language=language)
+    
+    if result.get("success") and roomCode.strip():
+        code = roomCode.strip().upper()
+        payload = {
+            "roomCode": code,
+            "speaker": speaker,
+            "text": result.get("text", ""),
+            "romanized": result.get("romanized", ""),
+            "language": result.get("language", "auto"),
+            "isFinal": True,
+            "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000)
+        }
+        await stream_transcript(payload)
+
+    return result
 
 
 # ==============================================================================
@@ -928,6 +967,13 @@ async def websocket_call_transcriber(websocket: WebSocket, user_id: str):
                         if data.get("phase") == "idle":
                             session.latest_state["partial"] = None
                     elif msg_type == "transcript":
+                        raw_t = str(data.get("text", "")).strip()
+                        if raw_t:
+                            rom_t, det_lang = to_romanized(raw_t)
+                            data["romanized"] = rom_t
+                            if not data.get("language") or data.get("language") == "auto":
+                                data["language"] = det_lang
+                            text_content = json.dumps(data)
                         if data.get("isFinal"):
                             segs = list(session.latest_state.get("segments") or [])
                             segs.append(data)
@@ -947,7 +993,8 @@ async def websocket_call_transcriber(websocket: WebSocket, user_id: str):
                                 "roomCode": uid,
                                 "speaker": speaker_label,
                                 "role": role_val,
-                                "text": data.get("text", ""),
+                                "text": raw_t,
+                                "romanized": data.get("romanized", ""),
                                 "isFinal": bool(data.get("isFinal", True)),
                                 "language": data.get("language") or session.latest_state.get("language") or "auto",
                                 "timestamp": data.get("ts") or int(datetime.now(timezone.utc).timestamp() * 1000),
@@ -971,16 +1018,19 @@ async def websocket_call_transcriber(websocket: WebSocket, user_id: str):
                 await call_stream_manager.broadcast_to_listeners(uid, text_content)
             elif "bytes" in msg and msg["bytes"]:
                 raw_pcm = msg["bytes"]
-                # 1. Broadcast raw binary PCM16 directly to /ws/listener/{uid} subscribers
+                # 1. Broadcast raw binary PCM16 directly to /ws/listener/{uid} subscribers (lowest latency, zero base64 overhead)
                 await call_stream_manager.broadcast_to_listeners(uid, raw_pcm)
-                # 2. Also bridge to signaling_manager if Master is connected via signaling socket
-                b64_pcm = base64.b64encode(raw_pcm).decode("ascii")
-                await signaling_manager.relay_audio(uid, "user", json.dumps({
-                    "type": "audio-chunk",
-                    "event": "audio-chunk",
-                    "pcm": b64_pcm,
-                    "source": "call",
-                }))
+                # 2. Only bridge to signaling_manager if no dedicated /ws/listener is connected
+                # to prevent duplicate audio packet collisions and lag
+                session = call_stream_manager.active_sessions.get(uid)
+                if not session or not session.listeners:
+                    b64_pcm = base64.b64encode(raw_pcm).decode("ascii")
+                    await signaling_manager.relay_audio(uid, "user", json.dumps({
+                        "type": "audio-chunk",
+                        "event": "audio-chunk",
+                        "pcm": b64_pcm,
+                        "source": "call",
+                    }))
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -1019,6 +1069,7 @@ async def receive_device_notification(req: NotificationEventRequest):
     Saves in MongoDB and relays to Master via WebSocket and FCM.
     """
     room_code = req.roomCode.strip().upper()
+    has_media = bool(req.mediaBase64 or req.hasMedia)
     notification_doc = {
         "roomCode": room_code,
         "deviceConnectionCode": room_code,
@@ -1031,6 +1082,9 @@ async def receive_device_notification(req: NotificationEventRequest):
         "category": req.category or "general",
         "postTime": req.postTime or int(datetime.now(timezone.utc).timestamp() * 1000),
         "isOngoing": req.isOngoing or False,
+        "mediaBase64": req.mediaBase64,
+        "mediaMimeType": req.mediaMimeType or ("image/jpeg" if req.mediaBase64 else None),
+        "hasMedia": has_media,
         "extraData": req.extraData or {},
         "createdAt": datetime.now(timezone.utc),
     }

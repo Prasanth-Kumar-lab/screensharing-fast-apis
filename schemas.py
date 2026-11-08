@@ -66,4 +66,7 @@ class NotificationEventRequest(BaseModel):
     category: Optional[str] = "general"
     postTime: Optional[int] = None
     isOngoing: Optional[bool] = False
+    mediaBase64: Optional[str] = None
+    mediaMimeType: Optional[str] = None
+    hasMedia: Optional[bool] = False
     extraData: Optional[Dict[str, Any]] = None
