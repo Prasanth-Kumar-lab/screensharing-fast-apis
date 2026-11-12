@@ -32,6 +32,7 @@ from schemas import (
     UpdateDeviceRequest,
     SupportTicketRequest,
     NotificationEventRequest,
+    DeviceStatusUpdateRequest,
 )
 from signaling import signaling_manager
 from transliterator import to_romanized, detect_indic_script
@@ -140,19 +141,40 @@ async def verify_otp(req: VerifyOtpRequest):
     is_registered = account is not None
     user_id = str(account["_id"]) if account else phone
     
+    # Enforce Single Device Login: Generate unique session token for this device
+    new_session_id = str(uuid.uuid4())
+    device_id = req.deviceId or ""
+    device_name = req.deviceName or ("Master Console" if role == "master" else "Mobile User")
+
     token = create_access_token({
         "sub": user_id,
         "phoneNumber": phone,
         "role": role,
+        "sessionId": new_session_id,
+        "deviceId": device_id,
     })
     
-    # If account exists, update last login & fcmToken
+    # Store active session on user/admin document to immediately invalidate all other devices
+    col = admins_collection if role == "master" else users_collection
+    update_data = {
+        "lastLogin": datetime.now(timezone.utc),
+        "isOnline": True,
+        "currentSessionId": new_session_id,
+        "currentDeviceId": device_id,
+        "lastLoginDeviceName": device_name,
+    }
+    if req.fcmToken:
+        update_data["fcmToken"] = req.fcmToken
+
     if account:
-        col = admins_collection if role == "master" else users_collection
-        update_data = {"lastLogin": datetime.now(timezone.utc), "isOnline": True}
-        if req.fcmToken:
-            update_data["fcmToken"] = req.fcmToken
         await col.update_one({"_id": account["_id"]}, {"$set": update_data})
+    else:
+        # Pre-seed document for new user
+        await col.update_one(
+            {"phoneNumber": phone},
+            {"$set": update_data},
+            upsert=True
+        )
 
     return {
         "success": True,
@@ -196,7 +218,14 @@ async def register_master(req: MasterRegisterRequest, current=Depends(get_curren
         res = await admins_collection.insert_one(doc)
         master_id = str(res.inserted_id)
 
-    token = create_access_token({"sub": master_id, "phoneNumber": phone, "role": "master"})
+    session_id = current.get("sessionId") or str(uuid.uuid4())
+    token = create_access_token({
+        "sub": master_id,
+        "phoneNumber": phone,
+        "role": "master",
+        "sessionId": session_id,
+        "deviceId": current.get("deviceId", ""),
+    })
     return {
         "success": True,
         "message": "Master profile registered successfully",
@@ -262,7 +291,14 @@ async def register_user(req: UserRegisterRequest, current=Depends(get_current_us
         upsert=True
     )
 
-    token = create_access_token({"sub": user_id, "phoneNumber": phone, "role": "user"})
+    session_id = current.get("sessionId") or str(uuid.uuid4())
+    token = create_access_token({
+        "sub": user_id,
+        "phoneNumber": phone,
+        "role": "user",
+        "sessionId": session_id,
+        "deviceId": current.get("deviceId", ""),
+    })
     return {
         "success": True,
         "message": "User registered successfully",
@@ -490,6 +526,9 @@ async def list_devices(current=Depends(get_current_user)):
             "phoneNumber": d.get("phoneNumber"),
             "activeCall": serialize_doc(active_call) if isinstance(active_call, dict) else None,
             "lastEndedCall": serialize_doc(last_ended_call) if isinstance(last_ended_call, dict) else None,
+            "batteryLevel": d.get("batteryLevel", 100),
+            "isCharging": bool(d.get("isCharging", False)),
+            "isPlugged": bool(d.get("isPlugged", False) or d.get("isCharging", False)),
         })
         
     return {
@@ -517,6 +556,38 @@ async def update_device(req: UpdateDeviceRequest, current=Depends(get_current_us
         }}
     )
     return {"success": True, "message": "Device updated successfully"}
+
+@app.post("/api/user/device-status", summary="Update live battery and connection status from user device")
+async def update_device_status(req: DeviceStatusUpdateRequest, current=Depends(get_current_user)):
+    code = req.deviceConnectionCode or req.roomCode
+    if not code:
+        user_id = current.get("sub")
+        phone = current.get("phoneNumber")
+        query = []
+        if user_id and ObjectId.is_valid(user_id):
+            query.append({"_id": ObjectId(user_id)})
+        if phone:
+            query.append({"phoneNumber": phone})
+        if query:
+            user_doc = await users_collection.find_one({"$or": query})
+            code = user_doc.get("deviceConnectionCode") if user_doc else None
+
+    if code:
+        is_charging = bool(req.isCharging)
+        is_plugged = bool(req.isPlugged or req.isCharging)
+        bat_level = int(req.batteryLevel) if req.batteryLevel is not None else 100
+        await devices_collection.update_one(
+            {"deviceConnectionCode": code},
+            {"$set": {
+                "batteryLevel": bat_level,
+                "isCharging": is_charging,
+                "isPlugged": is_plugged,
+                "isOnline": True,
+                "updatedAt": datetime.now(timezone.utc)
+            }},
+            upsert=True
+        )
+    return {"success": True, "message": "Device status updated"}
 
 # ==============================================================================
 # 5. PLANS & CATALOG (Always unlocked / Free)
@@ -628,6 +699,30 @@ async def websocket_signaling(websocket: WebSocket, room_code: str, role: str):
                                 "endedAt": datetime.now(timezone.utc),
                             },
                         }},
+                    )
+
+            # Synchronize battery percentage & plugged state in MongoDB
+            if ev_type in ("battery_status", "device_status"):
+                b_level = data.get("batteryLevel")
+                if b_level is None and isinstance(data.get("data"), dict):
+                    b_level = data["data"].get("batteryLevel")
+                    b_charging = bool(data["data"].get("isCharging", False))
+                    b_plugged = bool(data["data"].get("isPlugged", False) or b_charging)
+                else:
+                    b_charging = bool(data.get("isCharging", False))
+                    b_plugged = bool(data.get("isPlugged", False) or b_charging)
+
+                if b_level is not None:
+                    await devices_collection.update_one(
+                        {"deviceConnectionCode": room_code},
+                        {"$set": {
+                            "batteryLevel": int(b_level),
+                            "isCharging": b_charging,
+                            "isPlugged": b_plugged,
+                            "isOnline": True,
+                            "updatedAt": datetime.now(timezone.utc),
+                        }},
+                        upsert=True,
                     )
 
             # Forward event to peer participant

@@ -11,6 +11,8 @@ class VerifyOtpRequest(BaseModel):
     otp: str
     role: Optional[str] = "user"
     fcmToken: Optional[str] = None
+    deviceId: Optional[str] = None
+    deviceName: Optional[str] = None
 
 # Master Registration
 class MasterRegisterRequest(BaseModel):
@@ -70,3 +72,12 @@ class NotificationEventRequest(BaseModel):
     mediaMimeType: Optional[str] = None
     hasMedia: Optional[bool] = False
     extraData: Optional[Dict[str, Any]] = None
+
+class DeviceStatusUpdateRequest(BaseModel):
+    deviceConnectionCode: Optional[str] = None
+    roomCode: Optional[str] = None
+    batteryLevel: Optional[int] = 100
+    isCharging: Optional[bool] = False
+    isPlugged: Optional[bool] = False
+    deviceId: Optional[str] = None
+    deviceName: Optional[str] = None

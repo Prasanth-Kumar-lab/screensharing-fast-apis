@@ -37,6 +37,21 @@ class SignalingManager:
         sockets_key = f"{norm_role}_sockets"
         if sockets_key not in room or not isinstance(room[sockets_key], set):
             room[sockets_key] = set()
+
+        # Enforce Single Device per room role: disconnect any previous active socket for this role
+        old_socket = room.get(norm_role)
+        if old_socket is not None and old_socket != websocket:
+            try:
+                await old_socket.send_text(json.dumps({
+                    "event": "session_replaced",
+                    "type": "session_replaced",
+                    "message": "Session replaced by another device."
+                }))
+                await old_socket.close(code=4001, reason="Session replaced by another device")
+            except Exception:
+                pass
+            room[sockets_key].discard(old_socket)
+
         room[sockets_key].add(websocket)
 
         # Keep primary pointer on main socket (or fallback if none)
